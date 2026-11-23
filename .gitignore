@@ -1,0 +1,8 @@
+config.json
+cache*.json
+skip.txt
+translations/
+build_venv/
+build_tmp/
+dist/
+__pycache__/
