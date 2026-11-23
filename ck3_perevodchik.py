@@ -566,26 +566,35 @@ def gui():
         tk.Label(root, text=label, anchor="w").grid(row=i, column=0, sticky="w", padx=6, pady=3)
         v = tk.StringVar(value=cfg[key])
         vars_[key] = v
-        tk.Entry(root, textvariable=v, width=80).grid(row=i, column=1, padx=4)
+        tk.Entry(root, textvariable=v, width=60).grid(row=i, column=1, padx=4, sticky="we")
         tk.Button(root, text="...", command=lambda v=v: v.set(filedialog.askdirectory() or v.get())).grid(row=i, column=2, padx=4)
+    root.columnconfigure(1, weight=1)
+    root.rowconfigure(8, weight=1)
+    root.minsize(760, 560)
+
     tk.Label(root, text="Переводчик", anchor="w").grid(row=3, column=0, sticky="w", padx=6)
+    line = tk.Frame(root)
+    line.grid(row=3, column=1, columnspan=2, sticky="w", pady=2)
     eng = tk.StringVar(value=cfg["engine"])
-    ttk.Combobox(root, textvariable=eng, values=list(ENGINES), state="readonly", width=20).grid(row=3, column=1, sticky="w", padx=4)
-    lf = tk.Frame(root)
-    lf.grid(row=4, column=1, sticky="e")
+    ttk.Combobox(line, textvariable=eng, values=list(ENGINES), state="readonly", width=16).pack(side="left", padx=4)
     src_v, tgt_v = tk.StringVar(value=cfg["source_lang"]), tk.StringVar(value=cfg["target_lang"])
-    tk.Label(lf, text="С языка").pack(side="left")
-    ttk.Combobox(lf, textvariable=src_v, values=list(LANGS), state="readonly", width=13).pack(side="left", padx=4)
-    tk.Label(lf, text="на язык").pack(side="left")
-    ttk.Combobox(lf, textvariable=tgt_v, values=list(LANGS), state="readonly", width=13).pack(side="left", padx=4)
+    tk.Label(line, text="С языка").pack(side="left", padx=(16, 0))
+    ttk.Combobox(line, textvariable=src_v, values=list(LANGS), state="readonly", width=13).pack(side="left", padx=4)
+    tk.Label(line, text="на язык").pack(side="left")
+    ttk.Combobox(line, textvariable=tgt_v, values=list(LANGS), state="readonly", width=13).pack(side="left", padx=4)
+
+    checks = tk.Frame(root)
+    checks.grid(row=4, column=1, columnspan=2, sticky="w")
     only = tk.BooleanVar(value=cfg["only_enabled"])
-    tk.Checkbutton(root, text="Только моды из текущего плейсета", variable=only).grid(row=3, column=1, sticky="e")
+    tk.Checkbutton(checks, text="Только моды из текущего плейсета", variable=only).pack(anchor="w")
     create = tk.BooleanVar(value=cfg["create_missing_keys"])
-    tk.Checkbutton(root, text="Создавать отсутствующие ключи (решения, взаимодействия, черты)", variable=create).grid(row=4, column=1, sticky="w")
+    tk.Checkbutton(checks, text="Создавать отсутствующие ключи (решения, взаимодействия, черты)", variable=create).pack(anchor="w")
     again = tk.BooleanVar(value=False)
-    tk.Checkbutton(root, text="Перевести заново выбранным переводчиком (не брать из кэша)", variable=again).grid(row=5, column=1, sticky="w")
+    tk.Checkbutton(checks, text="Перевести заново выбранным переводчиком (не брать из кэша)", variable=again).pack(anchor="w")
     keys = tk.LabelFrame(root, text="Ключи API и модели (нужны только для выбранного переводчика)")
     keys.grid(row=6, column=0, columnspan=3, sticky="we", padx=6, pady=4)
+    keys.columnconfigure(1, weight=1)
+    keys.columnconfigure(3, weight=1)
     fields = [("openrouter_key", "OpenRouter: ключ", True), ("openrouter_model", "OpenRouter: модель", False),
               ("silk_key", "SilkCompute: ключ", True), ("silk_model", "SilkCompute: модель", False),
               ("deepl_key", "DeepL: ключ", True), ("google_cloud_key", "Google Cloud: ключ", True),
@@ -595,13 +604,14 @@ def gui():
         v = tk.StringVar(value=cfg.get(key, ""))
         vars_[key] = v
         if not key.endswith("_model"):
-            tk.Entry(keys, textvariable=v, width=42, show="*" if secret else "").grid(row=i // 2, column=(i % 2) * 2 + 1, padx=4)
+            tk.Entry(keys, textvariable=v, width=24, show="*" if secret else "").grid(
+                row=i // 2, column=(i % 2) * 2 + 1, padx=4, sticky="we", columnspan=3 if key == "style" else 1)
             continue
 
         # поле модели: выпадающий список с подсказкой по набранной части и кнопка проверки
         service = key[:-len("_model")]              # openrouter | silk
-        combo = ttk.Combobox(keys, textvariable=v, width=40)
-        combo.grid(row=i // 2, column=(i % 2) * 2 + 1, padx=4)
+        combo = ttk.Combobox(keys, textvariable=v, width=24)
+        combo.grid(row=i // 2, column=(i % 2) * 2 + 1, padx=4, sticky="we")
         models = []
 
         def base_key(service=service):
@@ -676,8 +686,8 @@ def gui():
         status.pack(in_=cell, side="left")
         if service == "openrouter" or vars_.get(service + "_key") and vars_[service + "_key"].get():
             load()
-    box =scrolledtext.ScrolledText(root, width=110, height=22)
-    box.grid(row=8, column=0, columnspan=3, padx=6, pady=6)
+    box = scrolledtext.ScrolledText(root, width=90, height=14)
+    box.grid(row=8, column=0, columnspan=3, padx=6, pady=6, sticky="nsew")
 
     def log(s):
         ui(lambda: (box.insert("end", s + "\n"), box.see("end")))
