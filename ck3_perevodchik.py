@@ -516,6 +516,27 @@ def gui():
     cfg = load_config()
     root = tk.Tk()
     root.title("CK3 Переводчик модов")
+
+    # Ctrl+C/V/X/A при русской (и любой не латинской) раскладке: Tk сам их не узнаёт
+    def hotkey(e):
+        if e.keysym.lower() in ("c", "v", "x", "a"):
+            return None                      # латинская раскладка: Tk справится сам
+        name = {67: "<<Copy>>", 86: "<<Paste>>", 88: "<<Cut>>", 65: "<<SelectAll>>"}.get(e.keycode)
+        if name:
+            e.widget.event_generate(name)
+            return "break"
+    root.bind_all("<Control-KeyPress>", hotkey)
+
+    # правая кнопка мыши: меню «Вырезать / Копировать / Вставить»
+    menu = tk.Menu(root, tearoff=0)
+    for label, name in (("Вырезать", "<<Cut>>"), ("Копировать", "<<Copy>>"), ("Вставить", "<<Paste>>")):
+        menu.add_command(label=label, command=lambda n=name: root.focus_get() and root.focus_get().event_generate(n))
+
+    def popup(e):
+        e.widget.focus_set()
+        menu.tk_popup(e.x_root, e.y_root)
+    root.bind_class("Entry", "<Button-3>", popup)
+    root.bind_class("Text", "<Button-3>", popup)
     vars_ = {}
     rows = [("mods_dir", "Папка модов (Документы)"), ("workshop_dir", "Папка модов Steam Workshop"),
             ("game_dir", "Папка игры (game)")]
