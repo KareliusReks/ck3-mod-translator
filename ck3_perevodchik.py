@@ -318,6 +318,14 @@ def llm(base, key, model, lines, cfg):
     return [str(x) for x in out] if isinstance(out, list) else []
 
 
+def fetch_models(base, key=""):
+    """Список моделей сервиса с API в формате OpenAI (GET /models)."""
+    headers = {"Authorization": "Bearer " + key} if key else {}
+    body = json.loads(http(base.rstrip("/") + "/models", None, headers))
+    data = body.get("data", body) if isinstance(body, dict) else body
+    return sorted({m["id"] for m in data if isinstance(m, dict) and m.get("id")})
+
+
 def openrouter(lines, cfg):
     return llm("https://openrouter.ai/api/v1", cfg["openrouter_key"], cfg["openrouter_model"], lines, cfg)
 
@@ -517,6 +525,20 @@ def gui():
     root = tk.Tk()
     root.title("CK3 Переводчик модов")
 
+    # фоновые потоки не трогают окно сами: они кладут действие в очередь, главный поток его выполняет
+    import queue
+    ui_queue = queue.Queue()
+    ui = ui_queue.put
+
+    def poll():
+        try:
+            while True:
+                ui_queue.get_nowait()()
+        except queue.Empty:
+            pass
+        root.after(50, poll)
+    root.after(50, poll)
+
     # Ctrl+C/V/X/A при русской (и любой не латинской) раскладке: Tk сам их не узнаёт
     def hotkey(e):
         if e.keysym.lower() in ("c", "v", "x", "a"):
@@ -572,12 +594,93 @@ def gui():
         tk.Label(keys, text=label, anchor="w").grid(row=i // 2, column=(i % 2) * 2, sticky="w", padx=4, pady=2)
         v = tk.StringVar(value=cfg.get(key, ""))
         vars_[key] = v
-        tk.Entry(keys, textvariable=v, width=42, show="*" if secret else "").grid(row=i // 2, column=(i % 2) * 2 + 1, padx=4)
-    box = scrolledtext.ScrolledText(root, width=110, height=22)
+        if not key.endswith("_model"):
+            tk.Entry(keys, textvariable=v, width=42, show="*" if secret else "").grid(row=i // 2, column=(i % 2) * 2 + 1, padx=4)
+            continue
+
+        # поле модели: выпадающий список с подсказкой по набранной части и кнопка проверки
+        service = key[:-len("_model")]              # openrouter | silk
+        combo = ttk.Combobox(keys, textvariable=v, width=40)
+        combo.grid(row=i // 2, column=(i % 2) * 2 + 1, padx=4)
+        models = []
+
+        def base_key(service=service):
+            if service == "openrouter":
+                return "https://openrouter.ai/api/v1", vars_["openrouter_key"].get().strip()
+            return cfg["silk_base"], vars_["silk_key"].get().strip()
+
+        def load(combo=combo, models=models, base_key=base_key, service=service, quiet=True):
+            base, k = base_key()                    # поля окна читаем только в главном потоке
+
+            def work():
+                try:
+                    got = fetch_models(base, k)
+                except Stop as e:
+                    if not quiet:
+                        log(f"{service}: список моделей не получен. {e}")
+                    return
+                models[:] = got
+                ui(lambda: combo.configure(values=got))
+                if not quiet:
+                    log(f"{service}: моделей в списке {len(got)}")
+            threading.Thread(target=work, daemon=True).start()
+
+        def suggest(e, combo=combo, models=models, v=v):
+            if e.keysym in ("Up", "Down", "Left", "Right", "Return", "Escape", "Tab", "Home", "End") or not models:
+                return
+            typed = combo.get()[:combo.index("insert")] if combo.selection_present() else combo.get()
+            low = typed.lower()
+            combo.configure(values=[m for m in models if low in m.lower()] if low else models)
+            if e.keysym in ("BackSpace", "Delete") or not low or len(e.char) != 1:
+                return
+            # дописать название: сначала совпадение с начала, потом после «/» (имя без поставщика)
+            match = next((m for m in models if m.lower().startswith(low)), None)
+            if match is None and "/" not in typed:
+                match = next((m for m in models if m.lower().split("/")[-1].startswith(low)), None)
+                if match:
+                    v.set(match)
+                    start_at = len(match) - len(match.split("/")[-1]) + len(typed)
+                    combo.icursor(start_at)
+                    combo.selection_range(start_at, "end")
+                return
+            if match:
+                v.set(match)
+                combo.icursor(len(typed))
+                combo.selection_range(len(typed), "end")
+
+        combo.bind("<KeyRelease>", suggest)
+        combo.configure(postcommand=lambda load=load, models=models: (None if models else load(quiet=False)))
+        status = tk.Label(keys, text="", width=3)
+
+        def test(base_key=base_key, v=v, status=status, service=service):
+            status.configure(text="...", fg="black")
+            model = v.get().strip()
+            base, k = base_key()
+
+            def work():
+                try:
+                    t0 = time.time()
+                    res = llm(base, k, model, ["Hello"], cfg)
+                    ok = bool(res)
+                    msg = (f"{service}: модель {model} доступна, ответ за {time.time() - t0:.1f} с: {res[0][:60]}" if ok
+                           else f"{service}: модель {model} ответила, но не в нужном формате. Для перевода она не подходит.")
+                except Stop as e:
+                    ok, msg = False, f"{service}: модель {model} недоступна. {e}"
+                log(msg)
+                ui(lambda: status.configure(text="✓" if ok else "✗", fg="green" if ok else "red"))
+            threading.Thread(target=work, daemon=True).start()
+
+        cell = tk.Frame(keys)
+        cell.grid(row=i // 2, column=4, padx=2)
+        tk.Button(cell, text="Тест", command=test).pack(side="left")
+        status.pack(in_=cell, side="left")
+        if service == "openrouter" or vars_.get(service + "_key") and vars_[service + "_key"].get():
+            load()
+    box =scrolledtext.ScrolledText(root, width=110, height=22)
     box.grid(row=8, column=0, columnspan=3, padx=6, pady=6)
 
     def log(s):
-        root.after(0, lambda: (box.insert("end", s + "\n"), box.see("end")))
+        ui(lambda: (box.insert("end", s + "\n"), box.see("end")))
 
     def start(dry=False, clean=False):
         for k, v in vars_.items():
