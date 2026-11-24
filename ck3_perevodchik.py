@@ -63,6 +63,8 @@ DEFAULTS = {
     "retranslate": False,          # перевести заново, не брать машинный перевод из кэша
     "style": "",                   # пожелания к стилю для нейросети, например: "обращение на ты"
     "create_missing_keys": True,
+    "selected_mods": [],           # папки модов, которые переводить; пусто = все
+    "skip_rules": None,            # исключения: [{"pattern": "^ключ", "on": true}], правятся в окне программы
     "same_is_untranslated": False, # считать непереведённым текст, который совпадает с исходным
     "threads": 4,                  # сколько запросов к переводчику идёт одновременно
     "only_enabled": True,          # только моды из текущего плейсета (dlc_load.json)
@@ -555,7 +557,30 @@ def seed_cache_from_mods(plan, cache, cfg):
 def load_config():
     cfg = dict(DEFAULTS)
     cfg.update(load_json(CONFIG, {}))
+    if not isinstance(cfg.get("skip_rules"), list):
+        rules = []
+        if SKIP.is_file():              # прежние версии хранили исключения в skip.txt
+            for line in read_text(SKIP).splitlines():
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    rules.append({"pattern": line, "on": True})
+        cfg["skip_rules"] = rules
+    if not isinstance(cfg.get("selected_mods"), list):
+        cfg["selected_mods"] = []
     return cfg
+
+
+def active_skip(cfg, log):
+    """Включённые исключения в виде готовых выражений. Ошибочное выражение пропускается с сообщением."""
+    out = []
+    for r in cfg.get("skip_rules") or []:
+        if not isinstance(r, dict) or not r.get("on", True) or not r.get("pattern"):
+            continue
+        try:
+            out.append(re.compile(r["pattern"]))
+        except re.error as e:
+            log(f"Исключение «{r['pattern']}» записано с ошибкой и не применяется: {e}")
+    return out
 
 
 def own_files(mod_dir):
@@ -576,7 +601,8 @@ def run(cfg, log, dry=False, clean=False):
         if on is None:
             log("Файл dlc_load.json не найден: беру все моды.")
         else:
-            mods = [m for m in mods if m[1].resolve() in on]
+            picked = set(cfg.get("selected_mods") or [])    # выбранный мод берётся и вне плейсета
+            mods = [m for m in mods if m[1].resolve() in on or str(m[1]) in picked]
             if not mods:
                 raise Stop("В плейсете нет включённых модов. Включите моды в лаунчере и запустите игру один раз.")
     if clean:
@@ -588,10 +614,9 @@ def run(cfg, log, dry=False, clean=False):
         log(f"Удалено файлов перевода: {n}")
         return
 
-    if not SKIP.is_file():
-        SKIP.write_text(DEFAULT_SKIP, encoding="utf-8")
-    skip = [re.compile(l.strip()) for l in SKIP.read_text(encoding="utf-8").splitlines()
-            if l.strip() and not l.startswith("#")]
+    if not isinstance(cfg.get("skip_rules"), list):
+        cfg["skip_rules"] = load_config()["skip_rules"]
+    skip = active_skip(cfg, log)
 
     src, tgt = cfg["source_lang"], cfg["target_lang"]
     if src not in LANGS or tgt not in LANGS or src == tgt:
@@ -620,8 +645,13 @@ def run(cfg, log, dry=False, clean=False):
             if lang == tgt:
                 hand.update(keys)
 
+    chosen = set(cfg.get("selected_mods") or [])
+    if chosen:
+        log(f"Перевожу только выбранные моды: {sum(1 for _, d in mods if str(d) in chosen)}")
     plan, texts = {}, []
     for name, d in mods:
+        if chosen and str(d) not in chosen:
+            continue                    # мод учитывается при поиске готовых переводов, но сам не переводится
         need = {k: v for k, v in en_mod[d].items() if k not in ru_all and k not in en_vanilla}
         same = 0
         if cfg.get("same_is_untranslated"):
@@ -740,7 +770,7 @@ def gui():
         tk.Button(root, text="...", command=lambda v=v: v.set(filedialog.askdirectory() or v.get())).grid(row=i, column=2, padx=4)
     root.columnconfigure(1, weight=1)
     root.rowconfigure(8, weight=1)
-    root.minsize(760, 560)
+    root.minsize(760, 600)
 
     tk.Label(root, text="Переводчик", anchor="w").grid(row=3, column=0, sticky="w", padx=6)
     line = tk.Frame(root)
@@ -766,6 +796,166 @@ def gui():
     tk.Checkbutton(checks, text="Считать непереведённым текст, который совпадает с исходным", variable=same_v).pack(anchor="w")
     again = tk.BooleanVar(value=False)
     tk.Checkbutton(checks, text="Перевести заново выбранным переводчиком (не брать из кэша)", variable=again).pack(anchor="w")
+    def save_cfg():
+        c = dict(cfg)
+        c["retranslate"] = False
+        save_json(CONFIG, c)
+
+    def check_list(title, hint, columns, rows, state, extra=None):
+        """Окно со списком и галочками. rows: [(id, значения столбцов)], state: {id: bool}."""
+        win = tk.Toplevel(root)
+        win.title(title)
+        win.geometry("780x500")
+        win.transient(root)
+        tk.Label(win, text=hint, anchor="w", justify="left").pack(fill="x", padx=8, pady=(8, 2))
+        frame = tk.Frame(win)
+        frame.pack(fill="both", expand=True, padx=8, pady=4)
+        tree = ttk.Treeview(frame, columns=["on"] + [c[0] for c in columns], show="headings", selectmode="browse")
+        tree.heading("on", text="")
+        tree.column("on", width=34, anchor="center", stretch=False)
+        for cid, text, width in columns:
+            tree.heading(cid, text=text)
+            tree.column(cid, width=width, anchor="w")
+        bar_y = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=bar_y.set)
+        tree.pack(side="left", fill="both", expand=True)
+        bar_y.pack(side="right", fill="y")
+
+        def mark(iid):
+            return "☑" if state.get(iid) else "☐"
+
+        def fill(items):
+            tree.delete(*tree.get_children())
+            for iid, values in items:
+                tree.insert("", "end", iid=iid, values=[mark(iid)] + list(values))
+
+        def toggle(iid):
+            state[iid] = not state.get(iid)
+            tree.set(iid, "on", mark(iid))
+
+        def click(e):
+            iid = tree.identify_row(e.y)
+            if iid:
+                toggle(iid)
+
+        tree.bind("<Button-1>", click)
+        tree.bind("<space>", lambda e: [toggle(i) for i in tree.selection()])
+        fill(rows)
+        buttons = tk.Frame(win)
+        buttons.pack(fill="x", padx=8, pady=8)
+
+        def set_all(value, only=None):
+            for iid in tree.get_children():
+                state[iid] = value if only is None else (iid in only)
+                tree.set(iid, "on", mark(iid))
+
+        win.tree, win.fill, win.set_all, win.buttons = tree, fill, set_all, buttons
+        if extra:
+            extra(win)
+        tk.Button(buttons, text="Готово", width=12, command=win.destroy).pack(side="right")
+        return win
+
+    def mods_label():
+        n = len(cfg.get("selected_mods") or [])
+        return f"выбрано модов: {n}" if n else "все моды"
+
+    def rules_label():
+        rules = cfg.get("skip_rules") or []
+        return f"включено {sum(1 for r in rules if r.get('on', True))} из {len(rules)}"
+
+    def pick_mods():
+        c = dict(cfg)
+        for k in ("mods_dir", "workshop_dir", "game_dir"):
+            c[k] = vars_[k].get()
+        mods = find_mods(c)
+        on = enabled_paths(c) or set()
+        chosen = set(cfg.get("selected_mods") or [])
+        in_set = {str(d) for _, d in mods if d.resolve() in on}
+        rows = sorted(((str(d), (name, "да" if str(d) in in_set else "", d.name)) for name, d in mods),
+                      key=lambda r: (r[1][1] != "да", r[1][0].lower()))
+        state = {iid: iid in chosen for iid, _ in rows}
+
+        def extra(win):
+            tk.Button(win.buttons, text="Отметить все", command=lambda: win.set_all(True)).pack(side="left", padx=2)
+            tk.Button(win.buttons, text="Снять все", command=lambda: win.set_all(False)).pack(side="left", padx=2)
+            tk.Button(win.buttons, text="Только плейсет", command=lambda: win.set_all(False, in_set)).pack(side="left", padx=2)
+
+        win = check_list("Какие моды переводить",
+                         "Отметьте моды, которые нужно перевести. Если не отмечен ни один, переводятся все моды.\n"
+                         "Щелчок по строке ставит или снимает галочку.",
+                         [("name", "Мод", 380), ("playset", "В плейсете", 90), ("dir", "Папка", 230)], rows, state, extra)
+
+        def done(e=None):
+            if e is not None and e.widget is not win:
+                return
+            cfg["selected_mods"] = [iid for iid, v in state.items() if v]
+            save_cfg()
+            mods_btn.configure(text=f"Моды... ({mods_label()})")
+        win.bind("<Destroy>", done)
+
+    def edit_rules():
+        rules = [dict(r) for r in (cfg.get("skip_rules") or []) if isinstance(r, dict) and r.get("pattern")]
+        state = {r["pattern"]: bool(r.get("on", True)) for r in rules}
+        order = [r["pattern"] for r in rules]
+
+        def extra(win):
+            row = tk.Frame(win)
+            row.pack(fill="x", padx=8, before=win.buttons)
+            tk.Label(row, text="Новое исключение").pack(side="left")
+            new_v = tk.StringVar()
+            entry = tk.Entry(row, textvariable=new_v)
+            entry.pack(side="left", fill="x", expand=True, padx=6)
+            note = tk.Label(win, text="", fg="red", anchor="w")
+            note.pack(fill="x", padx=8, before=win.buttons)
+
+            def add(e=None):
+                pat = new_v.get().strip()
+                if not pat:
+                    return
+                try:
+                    re.compile(pat)
+                except re.error as err:
+                    note.configure(text=f"Ошибка в выражении: {err}")
+                    return
+                note.configure(text="")
+                if pat not in state:
+                    order.append(pat)
+                state[pat] = True
+                win.fill([(x, (x,)) for x in order])
+                new_v.set("")
+
+            def remove():
+                for iid in win.tree.selection():
+                    order.remove(iid)
+                    state.pop(iid, None)
+                win.fill([(x, (x,)) for x in order])
+
+            entry.bind("<Return>", add)
+            tk.Button(row, text="Добавить", command=add).pack(side="left")
+            tk.Button(win.buttons, text="Удалить выбранное", command=remove).pack(side="left", padx=2)
+            tk.Button(win.buttons, text="Включить все", command=lambda: win.set_all(True)).pack(side="left", padx=2)
+            tk.Button(win.buttons, text="Выключить все", command=lambda: win.set_all(False)).pack(side="left", padx=2)
+
+        win = check_list("Исключения",
+                         "Ключи, которые не переводятся. Галочка включает исключение, без галочки оно не действует.\n"
+                         "Исключение — выражение по имени ключа: ^abc_ значит «ключи, которые начинаются на abc_».",
+                         [("pattern", "Исключение", 700)], [(x, (x,)) for x in order], state, extra)
+
+        def done(e=None):
+            if e is not None and e.widget is not win:
+                return
+            cfg["skip_rules"] = [{"pattern": x, "on": bool(state.get(x))} for x in order]
+            save_cfg()
+            rules_btn.configure(text=f"Исключения... ({rules_label()})")
+        win.bind("<Destroy>", done)
+
+    extra_bar = tk.Frame(root)
+    extra_bar.grid(row=5, column=1, columnspan=2, sticky="w", pady=2)
+    mods_btn = tk.Button(extra_bar, text=f"Моды... ({mods_label()})", command=pick_mods)
+    mods_btn.pack(side="left", padx=4)
+    rules_btn = tk.Button(extra_bar, text=f"Исключения... ({rules_label()})", command=edit_rules)
+    rules_btn.pack(side="left", padx=4)
+
     keys = tk.LabelFrame(root, text="Ключи API и модели (нужны только для выбранного переводчика)")
     keys.grid(row=6, column=0, columnspan=3, sticky="we", padx=6, pady=4)
     keys.columnconfigure(1, weight=1)
