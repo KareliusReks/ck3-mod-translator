@@ -22,7 +22,7 @@ CONFIG = HERE / "config.json"
 CACHE = HERE / "cache.json"       # английский -> русский; для других пар языков свой файл
 SKIP = HERE / "skip.txt"
 TRANSLATIONS = HERE / "translations"
-OUT_PREFIX = "zz_autoperevod_l_"
+OUT_PREFIX = "zz_autoperevod_"     # с этого начинаются имена всех файлов, которые создаёт программа
 
 # язык CK3: (код Google, код DeepL, название для нейросети)
 LANGS = {
@@ -589,6 +589,16 @@ def own_files(mod_dir):
     return [f for f in d.rglob(f"{OUT_PREFIX}*.yml")] if d.is_dir() else []
 
 
+def out_name(mod_dir, lang):
+    """Имя файла перевода, своё у каждого мода.
+
+    Игра складывает файлы всех модов в одно дерево: если у двух модов файл лежит по одному и тому же
+    пути, загружается только файл последнего мода. Поэтому в имя входит имя папки мода.
+    """
+    slug = re.sub(r"[^a-z0-9]+", "_", mod_dir.name.lower()).strip("_") or "mod"
+    return f"{OUT_PREFIX}{slug}_l_{lang}.yml"
+
+
 def run(cfg, log, dry=False, clean=False):
     CANCEL.clear()
     mods = find_mods(cfg)
@@ -703,10 +713,10 @@ def run(cfg, log, dry=False, clean=False):
         # папка replace: наши строки заменяют одноимённые строки самого мода
         out = d / "localization" / tgt / "replace"
         out.mkdir(parents=True, exist_ok=True)
-        target = out / f"{OUT_PREFIX}{tgt}.yml"
+        target = out / out_name(d, tgt)
         for old in own_files(d):
-            if old != target and old.name == target.name:
-                old.unlink()                # файл прежних версий программы лежал уровнем выше
+            if old != target and old.name.endswith(f"_l_{tgt}.yml"):
+                old.unlink()                # файл прежних версий: другое имя или другая папка
         target.write_text(f"l_{tgt}:\n" + "\n".join(lines) + "\n", encoding="utf-8-sig", newline="\n")
         written += 1
     log(f"Готово. Файлов записано: {written}. Строк осталось без перевода: {left}.")
