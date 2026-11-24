@@ -499,8 +499,57 @@ def load_json(p, default):
         return default
 
 
+SAVE_LOCK = threading.Lock()
+
+
 def save_json(p, obj):
-    p.write_text(json.dumps(obj, ensure_ascii=False, indent=1), encoding="utf-8")
+    """Запись через временный файл: если программу оборвут на середине, прежний файл останется целым."""
+    import os
+    text = json.dumps(obj, ensure_ascii=False, indent=1)
+    with SAVE_LOCK:
+        tmp = p.with_name(p.name + ".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, p)
+
+
+def load_cache(cfg, log):
+    """Кэш переводов. Если основной файл пуст или испорчен, берётся запасная копия."""
+    p = cache_path(cfg)
+    bak = p.with_name(p.name + ".bak")
+    cache = load_json(p, None)
+    if not isinstance(cache, dict) or (not cache and bak.is_file()):
+        old = load_json(bak, None)
+        if isinstance(old, dict) and old:
+            log(f"Файл кэша пуст или испорчен, взята запасная копия: {len(old)} строк.")
+            cache = old
+    if not isinstance(cache, dict):
+        cache = {}
+    if cache:
+        save_json(bak, cache)           # запасная копия на начало этого запуска
+    return cache
+
+
+def seed_cache_from_mods(plan, cache, cfg):
+    """Переводы, уже записанные этой программой в моды, возвращаются в кэш (если кэш потерян)."""
+    if cfg.get("retranslate"):
+        return 0
+    added = 0
+    for d, item in plan.items():
+        need = item[1]
+        done = {}
+        for f in own_files(d):
+            lang, keys = parse_yml(f)
+            if lang == cfg["target_lang"]:
+                done.update(keys)
+        for k, src in need.items():
+            tr = done.get(k)
+            if tr and tr != src and src not in cache and has_text(src):
+                cache[src] = tr
+                added += 1
+    return added
 
 
 def load_config():
@@ -598,7 +647,11 @@ def run(cfg, log, dry=False, clean=False):
     if dry:
         return
 
-    cache = load_json(cache_path(cfg), {})
+    cache = load_cache(cfg, log)
+    seeded = seed_cache_from_mods(plan, cache, cfg)
+    if seeded:
+        log(f"Из файлов перевода в модах возвращено в кэш: {seeded} строк.")
+        save_json(cache_path(cfg), cache)
     stopped = None
     try:
         translate_all(texts, cfg, cache, log)
@@ -861,9 +914,13 @@ def gui():
     tk.Button(bar, text="Удалить перевод", width=18, command=lambda: start(clean=True)).pack(side="left", padx=4)
     tk.Button(bar, text="Отмена", width=12, command=cancel).pack(side="left", padx=4)
     root.mainloop()
-    CANCEL.set()
+    CANCEL.set()                        # окно закрыто: останавливаем запросы
+    limit = time.time() + 5
+    while running["on"] and time.time() < limit:
+        time.sleep(0.1)                 # даём записать кэш и файлы в моды
     import os
-    os._exit(0)
+    with SAVE_LOCK:                     # не обрываем запись на середине
+        os._exit(0)
 
 
 def main():
