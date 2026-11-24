@@ -249,27 +249,56 @@ def has_text(s):
 
 # ----------------------------------------------------------------- движки
 
+REQUEST_LIMIT = 180                # секунд на один запрос, дольше не ждём
+
+
+def _fetch(req, box):
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            box["body"] = r.read().decode("utf-8", "replace")
+    except BaseException as e:      # noqa: ошибку разбирает вызывающий поток
+        box["err"] = e
+
+
 def http(url, data=None, headers=None):
-    """Запрос к сервису. Временные отказы (429, 5xx, обрыв связи) повторяются с паузой."""
+    """Запрос к сервису. Временные отказы (429, 5xx, обрыв связи, зависание) повторяются с паузой.
+
+    Сам запрос идёт в отдельном потоке: сервис может держать соединение открытым сколь угодно долго,
+    а нам нужно и общее ограничение по времени, и мгновенная реакция на «Отмену».
+    """
     last = ""
     for pause in (0, 3, 8, 20):
         if pause and CANCEL.wait(pause):
             raise Stop(CANCELLED)
         if CANCEL.is_set():
             raise Stop(CANCELLED)
-        req = urllib.request.Request(url, data=data, headers=headers or {})
-        try:
-            with urllib.request.urlopen(req, timeout=60) as r:
-                return r.read().decode("utf-8", "replace")
-        except urllib.error.HTTPError as e:
+        box = {}
+        t = threading.Thread(target=_fetch, args=(urllib.request.Request(url, data=data, headers=headers or {}), box),
+                             daemon=True)
+        t.start()
+        deadline = time.time() + REQUEST_LIMIT
+        while t.is_alive() and time.time() < deadline:
+            t.join(0.2)
+            if CANCEL.is_set():
+                raise Stop(CANCELLED)   # зависший запрос бросаем, его поток завершится сам
+        if t.is_alive():
+            last = f"Сервис перевода не ответил за {REQUEST_LIMIT} секунд. Перевод остановлен, сделанное сохранено."
+            continue
+        err = box.get("err")
+        if err is None:
+            return box["body"]
+        if isinstance(err, urllib.error.HTTPError):
             hint = {401: " Проверьте ключ API.", 402: " На счёте сервиса закончились средства.",
-                    404: " Проверьте название модели.", 429: " Слишком много запросов, попробуйте позже."}.get(e.code, "")
-            detail = e.read().decode("utf-8", "replace")[:200]
-            last = f"Сервис перевода ответил ошибкой {e.code}.{hint} {detail} Перевод остановлен, сделанное сохранено."
-            if e.code not in RETRY_CODES:
+                    404: " Проверьте название модели.", 429: " Слишком много запросов, попробуйте позже."}.get(err.code, "")
+            detail = err.read().decode("utf-8", "replace")[:200]
+            last = f"Сервис перевода ответил ошибкой {err.code}.{hint} {detail} Перевод остановлен, сделанное сохранено."
+            if err.code not in RETRY_CODES:
                 break
-        except OSError as e:
-            last = f"Нет связи с сервисом перевода: {e}"
+        elif isinstance(err, OSError):
+            last = f"Нет связи с сервисом перевода: {err}"
+        else:
+            last = f"Ошибка запроса: {err!r}"
+            break
     raise Stop(last)
 
 
@@ -821,7 +850,7 @@ def gui():
     def cancel():
         if running["on"]:
             CANCEL.set()
-            log("Отмена: жду, пока завершатся уже отправленные запросы...")
+            log("Отмена: останавливаю запросы, сохраняю уже переведённое...")
         else:
             log("Сейчас ничего не выполняется.")
 
@@ -832,6 +861,9 @@ def gui():
     tk.Button(bar, text="Удалить перевод", width=18, command=lambda: start(clean=True)).pack(side="left", padx=4)
     tk.Button(bar, text="Отмена", width=12, command=cancel).pack(side="left", padx=4)
     root.mainloop()
+    CANCEL.set()
+    import os
+    os._exit(0)
 
 
 def main():
