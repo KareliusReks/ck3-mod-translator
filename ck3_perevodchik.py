@@ -63,6 +63,8 @@ DEFAULTS = {
     "retranslate": False,          # перевести заново, не брать машинный перевод из кэша
     "style": "",                   # пожелания к стилю для нейросети, например: "обращение на ты"
     "create_missing_keys": True,
+    "same_is_untranslated": False, # считать непереведённым текст, который совпадает с исходным
+    "threads": 4,                  # сколько запросов к переводчику идёт одновременно
     "only_enabled": True,          # только моды из текущего плейсета (dlc_load.json)
     "skip_mods": [],               # моды, которые не трогать (часть названия)
 }
@@ -74,6 +76,11 @@ HEADER = re.compile(r'^\ufeff?\s*l_(\w+)\s*:')
 
 class Stop(Exception):
     pass
+
+
+CANCEL = threading.Event()         # выставляется кнопкой «Отмена»
+CANCELLED = "Перевод отменён."
+RETRY_CODES = {408, 429, 500, 502, 503, 504, 529}
 
 
 # ---------------------------------------------------------------- файлы
@@ -243,17 +250,27 @@ def has_text(s):
 # ----------------------------------------------------------------- движки
 
 def http(url, data=None, headers=None):
-    req = urllib.request.Request(url, data=data, headers=headers or {})
-    try:
-        with urllib.request.urlopen(req, timeout=30) as r:
-            return r.read().decode("utf-8", "replace")
-    except urllib.error.HTTPError as e:
-        hint = {401: " Проверьте ключ API.", 402: " На счёте сервиса закончились средства.",
-                404: " Проверьте название модели.", 429: " Слишком много запросов, попробуйте позже."}.get(e.code, "")
-        detail = e.read().decode("utf-8", "replace")[:200]
-        raise Stop(f"Сервис перевода ответил ошибкой {e.code}.{hint} {detail} Перевод остановлен, сделанное сохранено.")
-    except OSError as e:
-        raise Stop(f"Нет связи с сервисом перевода: {e}")
+    """Запрос к сервису. Временные отказы (429, 5xx, обрыв связи) повторяются с паузой."""
+    last = ""
+    for pause in (0, 3, 8, 20):
+        if pause and CANCEL.wait(pause):
+            raise Stop(CANCELLED)
+        if CANCEL.is_set():
+            raise Stop(CANCELLED)
+        req = urllib.request.Request(url, data=data, headers=headers or {})
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                return r.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as e:
+            hint = {401: " Проверьте ключ API.", 402: " На счёте сервиса закончились средства.",
+                    404: " Проверьте название модели.", 429: " Слишком много запросов, попробуйте позже."}.get(e.code, "")
+            detail = e.read().decode("utf-8", "replace")[:200]
+            last = f"Сервис перевода ответил ошибкой {e.code}.{hint} {detail} Перевод остановлен, сделанное сохранено."
+            if e.code not in RETRY_CODES:
+                break
+        except OSError as e:
+            last = f"Нет связи с сервисом перевода: {e}"
+    raise Stop(last)
 
 
 def google_free(lines, cfg):
@@ -345,13 +362,9 @@ ENGINES = {"google_free": google_free, "google_cloud": google_cloud, "deepl": de
 LLM_ENGINES = {"openrouter", "silkcompute", "custom"}
 
 
-def translate_all(texts, cfg, cache, log):
-    """Дополняет cache переводами для texts. Строки с разметкой защищаются плейсхолдерами."""
+def translate_batch(batch, cfg):
+    """Перевод одной пачки строк -> {исходная строка: перевод}. Ничего общего не трогает."""
     engine = ENGINES[cfg["engine"]]
-    again = cfg.get("retranslate")
-    todo = [t for t in dict.fromkeys(texts) if (again or t not in cache) and has_text(t)]
-    log(f"К переводу: {len(todo)} строк (в кэше уже {len(cache)})")
-    batch, size, done = [], 0, 0
 
     def call(lines):
         res = engine(lines, cfg)
@@ -359,42 +372,93 @@ def translate_all(texts, cfg, cache, log):
             time.sleep(0.4)
         return res
 
-    def flush():
-        nonlocal batch, size, done
-        if not batch:
-            return
-        prot = [protect(t) for t in batch]
-        res = call([p[0] for p in prot])
-        if len(res) != len(batch):          # сервис склеил строки: по одной
-            res = [(call([p[0]]) or [""])[0] for p in prot]
-        for src, (ptext, tokens), tr in zip(batch, prot, res):
-            out = restore(tr, tokens)
-            if out is None:                 # плейсхолдеры повреждены: переводим куски между ними
-                parts = re.split(r'(\{\d+\})', ptext)
-                idx = [i for i, p in enumerate(parts) if not re.fullmatch(r'\{\d+\}', p) and re.search(r'[^\W\d_]', p)]
-                if idx:
-                    got = call([parts[i].strip() for i in idx])
-                    if len(got) == len(idx):
-                        for i, g in zip(idx, got):
-                            lead = parts[i][:len(parts[i]) - len(parts[i].lstrip())]
-                            tail = parts[i][len(parts[i].rstrip()):]
-                            parts[i] = lead + g + tail
-                out = restore("".join(parts), tokens) or src
-            cache[src] = out
-        done += len(batch)
-        batch, size = [], 0
-        save_json(cache_path(cfg), cache)
-        log(f"  переведено {done} из {len(todo)}")
+    prot = [protect(t) for t in batch]
+    res = call([p[0] for p in prot])
+    if len(res) != len(batch):          # сервис склеил строки: по одной
+        res = [(call([p[0]]) or [""])[0] for p in prot]
+    out = {}
+    for src, (ptext, tokens), tr in zip(batch, prot, res):
+        text = restore(tr, tokens)
+        if text is None:                # плейсхолдеры повреждены: переводим куски между ними
+            parts = re.split(r'(\{\d+\})', ptext)
+            idx = [i for i, p in enumerate(parts) if not re.fullmatch(r'\{\d+\}', p) and re.search(r'[^\W\d_]', p)]
+            if idx:
+                got = call([parts[i].strip() for i in idx])
+                if len(got) == len(idx):
+                    for i, g in zip(idx, got):
+                        lead = parts[i][:len(parts[i]) - len(parts[i].lstrip())]
+                        tail = parts[i][len(parts[i].rstrip()):]
+                        parts[i] = lead + g + tail
+            text = restore("".join(parts), tokens) or src
+        out[src] = text
+    return out
 
+
+def translate_all(texts, cfg, cache, log):
+    """Дополняет cache переводами для texts. Пачки строк переводятся в несколько потоков."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    again = cfg.get("retranslate")
+    todo = [t for t in dict.fromkeys(texts) if (again or t not in cache) and has_text(t)]
+    batches, batch, size = [], [], 0
+    for t in todo:
+        if batch and (size + len(t) > 3500 or len(batch) >= 40):
+            batches.append(batch)
+            batch, size = [], 0
+        batch.append(t)
+        size += len(t)
+    if batch:
+        batches.append(batch)
     try:
-        for t in todo:
-            if size + len(t) > 3500 or len(batch) >= 40:
-                flush()
-            batch.append(t)
-            size += len(t)
-        flush()
+        threads = max(1, min(16, int(cfg.get("threads") or 1)))
+    except (TypeError, ValueError):
+        threads = 1
+    if cfg["engine"] == "google_free":
+        threads = 1                     # бесплатный Google за параллельные запросы блокирует
+    threads = min(threads, max(1, len(batches)))
+    log(f"К переводу: {len(todo)} строк (в кэше уже {len(cache)}), потоков: {threads}")
+
+    lock = threading.Lock()             # кэш и счётчик меняет только один поток за раз
+    state = {"done": 0, "saved": time.time()}
+    abort = threading.Event()           # один поток упал: остальные не начинают новые пачки
+
+    def work(batch):
+        if CANCEL.is_set():
+            raise Stop(CANCELLED)
+        if abort.is_set():
+            return
+        result = translate_batch(batch, cfg)
+        with lock:
+            cache.update(result)
+            state["done"] += len(batch)
+            if time.time() - state["saved"] > 5:
+                save_json(cache_path(cfg), cache)
+                state["saved"] = time.time()
+            log(f"  переведено {state['done']} из {len(todo)}")
+
+    error = None
+    try:
+        if threads == 1:
+            for b in batches:
+                work(b)
+        else:
+            with ThreadPoolExecutor(max_workers=threads) as pool:
+                futures = [pool.submit(work, b) for b in batches]
+                for f in as_completed(futures):
+                    try:
+                        f.result()
+                    except Stop as e:
+                        if error is None:
+                            error = e
+                            abort.set()
+                            for other in futures:
+                                other.cancel()
+                    except Exception:
+                        pass            # уже отменённая пачка
     finally:
-        save_json(cache_path(cfg), cache)
+        with lock:
+            save_json(cache_path(cfg), cache)
+    if error is not None:
+        raise error
 
 
 # ---------------------------------------------------------------- основное
@@ -416,7 +480,14 @@ def load_config():
     return cfg
 
 
+def own_files(mod_dir):
+    """Файлы перевода, которые создала эта программа (в любой подпапке localization)."""
+    d = mod_dir / "localization"
+    return [f for f in d.rglob(f"{OUT_PREFIX}*.yml")] if d.is_dir() else []
+
+
 def run(cfg, log, dry=False, clean=False):
+    CANCEL.clear()
     mods = find_mods(cfg)
     if not mods:
         raise Stop("Моды не найдены. Проверьте пути к папкам.")
@@ -433,7 +504,7 @@ def run(cfg, log, dry=False, clean=False):
     if clean:
         n = 0
         for _, d in mods:
-            for f in (d / "localization").glob(f"*/{OUT_PREFIX}*.yml"):
+            for f in own_files(d):
                 f.unlink()
                 n += 1
         log(f"Удалено файлов перевода: {n}")
@@ -450,7 +521,8 @@ def run(cfg, log, dry=False, clean=False):
     log(f"Перевод: {LANGS[src][2]} -> {LANGS[tgt][2]}")
     game = Path(cfg["game_dir"])
     log("Читаю локализацию игры...")
-    ru_all = set(loc_keys(game, tgt))
+    ru_text = loc_keys(game, tgt)      # ключ -> текст на языке перевода (игра и все моды)
+    ru_all = set(ru_text)
     en_vanilla = set(loc_keys(game, src))
     if not ru_all:
         log("ВНИМАНИЕ: локализация игры на языке перевода не найдена, проверьте путь к игре.")
@@ -458,8 +530,9 @@ def run(cfg, log, dry=False, clean=False):
 
     en_mod, any_mod = {}, {}
     for name, d in mods:
-        ru_all.update(loc_keys(d, tgt))
+        ru_text.update(loc_keys(d, tgt))
         en_mod[d] = loc_keys(d, src)
+    ru_all = set(ru_text)
     en_everything = en_vanilla.union(*[set(v) for v in en_mod.values()]) if en_mod else en_vanilla
 
     hand = {}
@@ -472,6 +545,13 @@ def run(cfg, log, dry=False, clean=False):
     plan, texts = {}, []
     for name, d in mods:
         need = {k: v for k, v in en_mod[d].items() if k not in ru_all and k not in en_vanilla}
+        same = 0
+        if cfg.get("same_is_untranslated"):
+            # «перевод» есть, но он слово в слово повторяет исходный текст
+            for k, v in en_mod[d].items():
+                if k not in need and k not in en_vanilla and ru_text.get(k) == v and has_text(v):
+                    need[k] = v
+                    same += 1
         created = {}
         if cfg.get("create_missing_keys") and src == "english":
             known = en_everything | ru_all
@@ -479,12 +559,13 @@ def run(cfg, log, dry=False, clean=False):
             need.update(created)
         need = {k: v for k, v in need.items() if not any(r.search(k) for r in skip)}
         if need:
-            plan[d] = (name, need, len(created))
+            plan[d] = (name, need, len(created), same)
             texts += [v for k, v in need.items() if k not in hand]
     total = sum(len(p[1]) for p in plan.values())
     log(f"Модов с непереведённым текстом: {len(plan)}, строк: {total}")
-    for d, (name, need, nc) in plan.items():
-        log(f"  {name}: {len(need)} строк" + (f", из них создано ключей: {nc}" if nc else ""))
+    for d, (name, need, nc, same) in plan.items():
+        log(f"  {name}: {len(need)} строк" + (f", из них создано ключей: {nc}" if nc else "")
+            + (f", совпадает с исходным: {same}" if same else ""))
     if dry:
         return
 
@@ -497,7 +578,7 @@ def run(cfg, log, dry=False, clean=False):
         log(stopped)
 
     written = left = 0
-    for d, (name, need, nc) in plan.items():
+    for d, (name, need, nc, same) in plan.items():
         lines = []
         for k, v in need.items():
             tr = hand.get(k) or cache.get(v)
@@ -507,12 +588,19 @@ def run(cfg, log, dry=False, clean=False):
                 tr = v                      # пока на исходном языке, чтобы не было имени ключа
             tr = tr.replace("\n", "\\n")
             lines.append(f' {k}: "{tr}"')
-        out = d / "localization" / tgt
+        # папка replace: наши строки заменяют одноимённые строки самого мода
+        out = d / "localization" / tgt / "replace"
         out.mkdir(parents=True, exist_ok=True)
-        (out / f"{OUT_PREFIX}{tgt}.yml").write_text(f"l_{tgt}:\n" + "\n".join(lines) + "\n", encoding="utf-8-sig", newline="\n")
+        target = out / f"{OUT_PREFIX}{tgt}.yml"
+        for old in own_files(d):
+            if old != target and old.name == target.name:
+                old.unlink()                # файл прежних версий программы лежал уровнем выше
+        target.write_text(f"l_{tgt}:\n" + "\n".join(lines) + "\n", encoding="utf-8-sig", newline="\n")
         written += 1
     log(f"Готово. Файлов записано: {written}. Строк осталось без перевода: {left}.")
-    if stopped:
+    if stopped == CANCELLED:
+        log("Уже переведённое сохранено и записано в моды. Чтобы продолжить, нажмите «Перевести» ещё раз.")
+    elif stopped:
         log("Перевод прерван. Запустите программу ещё раз позже: уже переведённое сохранено.")
 
 
@@ -582,6 +670,9 @@ def gui():
     ttk.Combobox(line, textvariable=src_v, values=list(LANGS), state="readonly", width=13).pack(side="left", padx=4)
     tk.Label(line, text="на язык").pack(side="left")
     ttk.Combobox(line, textvariable=tgt_v, values=list(LANGS), state="readonly", width=13).pack(side="left", padx=4)
+    threads_v = tk.StringVar(value=str(cfg.get("threads", 4)))
+    tk.Label(line, text="Потоков").pack(side="left", padx=(16, 0))
+    tk.Spinbox(line, from_=1, to=16, width=3, textvariable=threads_v).pack(side="left", padx=4)
 
     checks = tk.Frame(root)
     checks.grid(row=4, column=1, columnspan=2, sticky="w")
@@ -589,6 +680,8 @@ def gui():
     tk.Checkbutton(checks, text="Только моды из текущего плейсета", variable=only).pack(anchor="w")
     create = tk.BooleanVar(value=cfg["create_missing_keys"])
     tk.Checkbutton(checks, text="Создавать отсутствующие ключи (решения, взаимодействия, черты)", variable=create).pack(anchor="w")
+    same_v = tk.BooleanVar(value=cfg.get("same_is_untranslated", False))
+    tk.Checkbutton(checks, text="Считать непереведённым текст, который совпадает с исходным", variable=same_v).pack(anchor="w")
     again = tk.BooleanVar(value=False)
     tk.Checkbutton(checks, text="Перевести заново выбранным переводчиком (не брать из кэша)", variable=again).pack(anchor="w")
     keys = tk.LabelFrame(root, text="Ключи API и модели (нужны только для выбранного переводчика)")
@@ -692,15 +785,27 @@ def gui():
     def log(s):
         ui(lambda: (box.insert("end", s + "\n"), box.see("end")))
 
+    running = {"on": False}
+
     def start(dry=False, clean=False):
+        if running["on"]:
+            log("Работа уже идёт. Дождитесь конца или нажмите «Отмена».")
+            return
         for k, v in vars_.items():
             cfg[k] = v.get()
         cfg["engine"], cfg["create_missing_keys"] = eng.get(), create.get()
         cfg["only_enabled"] = only.get()
         cfg["source_lang"], cfg["target_lang"] = src_v.get(), tgt_v.get()
+        cfg["same_is_untranslated"] = same_v.get()
+        try:
+            cfg["threads"] = max(1, min(16, int(threads_v.get())))
+        except ValueError:
+            cfg["threads"] = 1
         cfg["retranslate"] = False
         save_json(CONFIG, cfg)
         cfg["retranslate"] = again.get()
+
+        running["on"] = True
 
         def work():
             try:
@@ -709,13 +814,23 @@ def gui():
                 log(str(e))
             except Exception as e:  # noqa
                 log(f"Ошибка: {e!r}")
+            finally:
+                running["on"] = False
         threading.Thread(target=work, daemon=True).start()
+
+    def cancel():
+        if running["on"]:
+            CANCEL.set()
+            log("Отмена: жду, пока завершатся уже отправленные запросы...")
+        else:
+            log("Сейчас ничего не выполняется.")
 
     bar = tk.Frame(root)
     bar.grid(row=7, column=0, columnspan=3, pady=4)
     tk.Button(bar, text="Перевести", width=18, command=start).pack(side="left", padx=4)
     tk.Button(bar, text="Только отчёт", width=18, command=lambda: start(dry=True)).pack(side="left", padx=4)
     tk.Button(bar, text="Удалить перевод", width=18, command=lambda: start(clean=True)).pack(side="left", padx=4)
+    tk.Button(bar, text="Отмена", width=12, command=cancel).pack(side="left", padx=4)
     root.mainloop()
 
 
